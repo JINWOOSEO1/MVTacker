@@ -14,4 +14,4 @@ kornia==0.7.3
 flow-vis==0.1
 moviepy==1.0.3
 mediapy==1.2.0
-rerun-sdk==0.21.0
+#rerun-sdk==0.21.0

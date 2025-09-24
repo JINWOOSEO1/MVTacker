@@ -1,3 +1,5 @@
+# -*- coding: utf-8 -*-
+
 import argparse
 import os
 import warnings
@@ -96,7 +98,7 @@ def main():
         pts = pool[idx]
         ts = torch.full((pts.shape[0], 1), float(t0), device=pts.device)
         query_points = torch.cat([ts, pts], dim=1).float()  # (N,4): (t,x,y,z)
-        print(f"Sampled {pts.shape[0]} queries from depth at t={t0} within r<={xy_radius}, z∈[{z_min},{z_max}].")
+        print(f"Sampled {pts.shape[0]} queries from depth at t={t0} within r<={xy_radius}, z in [{z_min},{z_max}].")
 
     # Run prediction
     torch.set_float32_matmul_precision("high")
