@@ -6,7 +6,7 @@ def lift_pixels_to_world(depths, intrs, extrs):
     """
     depths: (1, H, W) depth map
     intrs: (3, 3) intrinsic matrix
-    extrs: (3, 4) extrinsic matrix (world → cam)
+    extrs: (4, 4) extrinsic matrix (world → cam)
 
     world_coords: (3, H, W)
     """
@@ -26,8 +26,7 @@ def lift_pixels_to_world(depths, intrs, extrs):
     cam_coords = (K_inv @ pix.view(-1, 3).T) * depths.view(-1).reshape(1,-1)  # (3, N)
 
     #Calculate world frame coordinate
-    R = extrs[:, :3]  # (3,3)
-    t = extrs[:, 3]   # (3,)
-    world_coords = R.T @ (cam_coords - t.view(3,1))  # (3, N)
-
+    R = extrs[0:3, :3]  # (3,3)
+    t = extrs[0:3, 3]   # (3,)
+    world_coords = R.T @ (cam_coords - t.view(3,1))
     return world_coords.T.view(H, W, 3)  # (H, W, 3)

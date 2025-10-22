@@ -17,7 +17,7 @@ from typing import *
 import matplotlib
 import mediapy as media
 import numpy as np
-import rerun as rr
+#import rerun as rr
 import torch
 from PIL import Image
 from scipy.spatial.transform import Rotation as R

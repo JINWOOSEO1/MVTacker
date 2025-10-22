@@ -94,9 +94,9 @@ class MVTracker(nn.Module):
     def __init__(
             self,
             sliding_window_len=12,
-            stride=4,
+            stride=8,
             normalize_scene_in_fwd_pass=False,
-            fmaps_dim=128,
+            fmaps_dim=64,
             add_space_attn=True,
             num_heads=6,
             hidden_size=384,
