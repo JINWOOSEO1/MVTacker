@@ -23,12 +23,10 @@ class DataCaptureNode:
         self.num_cameras = num_cameras
 
         self.rgb_subscribers = []
-        self.rgb_right_subscribers = []
         self.depth_subscribers = []
         self.camera_info_subscribers = []
 
         self.rgb_images = [None] * num_cameras
-        self.rgb_right_images = [None] * num_cameras
         self.depth_images = [None] * num_cameras
         self.camera_infos = [None] * num_cameras
 
@@ -131,12 +129,12 @@ if __name__ == "__main__":
 
     img_idx = 0
     is_recording = False
+
     while not rospy.is_shutdown():
+
         for i in range(args.num_cameras):
             if capture_node.rgb_images[i] is not None:
                 cv2.imshow(f"Camera {i} RGB", capture_node.rgb_images[i])
-            # if capture_node.rgb_right_images[i] is not None:
-            #     cv2.imshow(f"Camera {i} RGB Right", capture_node.rgb_right_images[i])
             if capture_node.depth_images[i] is not None:
                 depth = capture_node.depth_images[i].copy()
                 depth = depth / 1000.0

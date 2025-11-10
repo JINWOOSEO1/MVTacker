@@ -21,6 +21,7 @@ from mvtracker.models.core.model_utils import smart_cat, init_pointcloud_from_rg
 from mvtracker.models.core.spatracker.blocks import BasicEncoder
 from mvtracker.utils.basic import time_now
 
+import pdb
 
 # ---------- KNN backends ----------
 def _knn_pointops(k: int, xyz_ref: torch.Tensor, xyz_query: torch.Tensor):
@@ -90,7 +91,7 @@ except Exception:
     knn = _knn_torch
 
 
-class MVTracker(nn.Module):
+class MVTrackerOnline(nn.Module):
     def __init__(
             self,
             sliding_window_len=12,
@@ -181,6 +182,17 @@ class MVTracker(nn.Module):
 
         self.stats_pyramid = None
         self.stats_depth = None
+    
+    # Initialize online variable
+    def init_video_online_processing(self):
+        self.online_ind = 0
+        self.online_feat_init = None # Save the features of the query points up to this window (1, S, partial_N, 3)
+
+        self.online_coords_predicted = None # result of last window prediction(B, S, partial_N, 3) 
+        self.online_vis_predicted = None # result of last window prediction(B, S, partial_N)
+
+        self.p_idx_start = 0
+        self.p_idx_end = None
 
     def fnet_fwd(self, rgbs_normalized, image_features=None):
         b, v, t, _, h, w = rgbs_normalized.shape
@@ -397,7 +409,8 @@ class MVTracker(nn.Module):
 
             coords = coords + d_coord
             ffeats = ffeats + d_feats
-            
+            # pdb.set_trace()
+
             if torch.isnan(coords).any():
                 logging.error("Got NaN values in coords, perhaps the training exploded")
                 import ipdb
@@ -502,7 +515,7 @@ class MVTracker(nn.Module):
         # Filter the points that never appear during 1 - T
         assert batch_size == 1, "Batch size > 1 is not supported yet"
         query_points_t = query_points_t.squeeze(0).squeeze(-1)  # BN1 --> N
-        ind_array = torch.arange(num_frames, device=query_points.device)
+        ind_array = torch.arange(self.online_ind, self.online_ind + num_frames, device=query_points.device) 
         ind_array = ind_array[None, :, None].repeat(batch_size, 1, num_points)
         track_mask = (ind_array >= query_points_t[None, None, :]).unsqueeze(-1)  # TODO: >= or >?
 
@@ -528,175 +541,118 @@ class MVTracker(nn.Module):
         traj_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points, 3))
         vis_e_ = coords_init_.new_zeros((batch_size, num_frames, num_points))
 
-        w_idx_start = query_points_t_.min()
-        p_idx_start = 0
+        ###################################Modified region##################################################
         vis_predictions = []
         coord_predictions = []
-        p_idx_end_list = []
-        fmaps_seq, depths_seq, feat_init, rerun_fmap_coloring_fn = None, None, None, None
-        while w_idx_start < num_frames - self.S // 2:
-            curr_wind_points = torch.nonzero(query_points_t_ < w_idx_start + self.S)
-            assert curr_wind_points.shape[0] > 0
-            p_idx_end = curr_wind_points[-1].item() + 1
-            p_idx_end_list.append(p_idx_end)
+        rerun_fmap_coloring_fn = None
 
-            intrs_seq = intrs[:, :, w_idx_start:w_idx_start + self.S]
-            extrs_seq = extrs[:, :, w_idx_start:w_idx_start + self.S]
+        assert (self.online_ind is not None), "Call model.init_video_online_processing() first."
+        curr_wind_points = torch.nonzero(query_points_t_ < self.online_ind + self.S)
+        assert curr_wind_points.shape[0] > 0, "There should be at least one point in the current sliding window"
+        self.p_idx_end = curr_wind_points[-1].item() + 1
 
-            # Compute fmaps and interpolated depth on a rolling basis
-            # to reduce peak GPU memory consumption, but don't recompute
-            # for the overlapping part of a window
-            if fmaps_seq is None:
-                assert depths_seq is None
-                new_seq_t0 = w_idx_start
-            else:
-                fmaps_seq = fmaps_seq[:, :, self.S // 2:]
-                depths_seq = depths_seq[:, :, self.S // 2:]
-                new_seq_t0 = w_idx_start + self.S // 2
-            new_seq_t1 = w_idx_start + self.S
+        depths_interp = nn.functional.interpolate(
+            input=depths.to(device).reshape(-1, 1, height, width),
+            scale_factor = 1 / self.stride,
+            mode = "nearest",
+        ).reshape(batch_size, num_views, num_frames, 1, strided_height, strided_width)
+        
+        _fmaps_interp = self.fnet_fwd(
+            (2 * (rgbs.to(device) / 255.0) - 1.0),
+            image_features,
+        )
+        fmaps_interp = nn.functional.interpolate(
+            input=_fmaps_interp,
+            size=(strided_height, strided_width),
+            mode="bilinear",
+        ).reshape(batch_size, num_views, num_frames, self.latent_dim, strided_height, strided_width)
 
-            _depths_seq_new = nn.functional.interpolate(
-                input=depths[:, :, new_seq_t0:new_seq_t1].to(device).reshape(-1, 1, height, width),
-                scale_factor=1.0 / self.stride,
-                mode="nearest",
-            ).reshape(batch_size, num_views, -1, 1, strided_height, strided_width)
-            depths_seq = smart_cat(depths_seq, _depths_seq_new, dim=2)
+        #if save_rerun_logs:
+        
+        assert num_frames <= self.S, "This is online mode, so num_frames should be less than or equal to length of sliding window"
+        if num_frames < self.S:
+            diff = self.S - num_frames
+            fmaps_interp = torch.cat([fmaps_interp, fmaps_interp[:, :, -1:].repeat(1, 1, diff, 1, 1, 1)], dim=2)
+            depths_interp = torch.cat([depths_interp, depths_interp[:, :, -1:].repeat(1, 1, diff, 1, 1, 1)], dim=2)
+            intrs = torch.cat([intrs, intrs[:, :, -1:].repeat(1, 1, diff, 1, 1)], dim=2)
+            extrs = torch.cat([extrs, extrs[:, :, -1:].repeat(1, 1, diff, 1, 1)], dim=2)
 
-            _fmaps_seq_new = self.fnet_fwd(
-                (2 * (rgbs[:, :, new_seq_t0: new_seq_t1].to(device) / 255.0) - 1.0),
-                image_features,
-            )
-            _fmaps_seq_new = nn.functional.interpolate(
-                input=_fmaps_seq_new,
-                size=(strided_height, strided_width),
-                mode="bilinear",
-            ).reshape(batch_size, num_views, -1, self.latent_dim, strided_height, strided_width)
-            fmaps_seq = smart_cat(fmaps_seq, _fmaps_seq_new, dim=2)
-
-            if save_rerun_logs and rerun_fmap_coloring_fn is None:
-                valid_depths_mask = depths_seq.detach().cpu().squeeze(3) > 0
-                fvec_flat = fmaps_seq.detach().cpu().permute(0, 1, 2, 4, 5, 3)[valid_depths_mask].numpy()
-                from sklearn.decomposition import PCA
-                reducer = PCA(n_components=3)
-                reducer.fit(fvec_flat)
-                fvec_reduced = reducer.transform(fvec_flat)
-                reducer_min = fvec_reduced.min(axis=0)
-                reducer_max = fvec_reduced.max(axis=0)
-
-                def fvec_to_rgb(fvec):
-                    input_shape = fvec.shape
-                    assert input_shape[-1] == self.latent_dim
-                    fvec_reduced = reducer.transform(fvec.reshape(-1, self.latent_dim))
-                    fvec_reduced = np.clip(fvec_reduced, reducer_min[None, :], reducer_max[None, :])
-                    fvec_reduced_rescaled = (fvec_reduced - reducer_min) / (reducer_max - reducer_min)
-                    fvec_reduced_rgb = (fvec_reduced_rescaled * 255).astype(int)
-                    fvec_reduced_rgb = fvec_reduced_rgb.reshape(input_shape[:-1] + (3,))
-                    return fvec_reduced_rgb
-
-                rerun_fmap_coloring_fn = fvec_to_rgb
-
-            S_local = fmaps_seq.shape[2]
-            if S_local < self.S:
-                diff = self.S - S_local
-                fmaps_seq = torch.cat([fmaps_seq, fmaps_seq[:, :, -1:].repeat(1, 1, diff, 1, 1, 1)], 2)
-                depths_seq = torch.cat([depths_seq, depths_seq[:, :, -1:].repeat(1, 1, diff, 1, 1, 1)], 2)
-                intrs_seq = torch.cat([intrs_seq, intrs_seq[:, :, -1:].repeat(1, 1, diff, 1, 1)], 2)
-                extrs_seq = torch.cat([extrs_seq, extrs_seq[:, :, -1:].repeat(1, 1, diff, 1, 1)], 2)
-
-            # Compute the feature vector initialization for the new query points
-            if p_idx_end - p_idx_start > 0:
-                rgbd_xyz, rgbd_fvec = init_pointcloud_from_rgbd(
-                    fmaps=_fmaps_seq_new,
-                    depths=_depths_seq_new,
-                    intrs=intrs[:, :, new_seq_t0:new_seq_t1],
-                    extrs=extrs[:, :, new_seq_t0:new_seq_t1],
-                    stride=self.stride,
-                )
-
-                new_num_frames = _fmaps_seq_new.shape[2]
-                rgbd_xyz = rgbd_xyz.reshape(batch_size, new_num_frames, num_views, strided_height * strided_width, 3)
-                rgbd_fvec = rgbd_fvec.reshape(batch_size, new_num_frames, num_views, strided_height * strided_width,
-                                              self.latent_dim)
-
-                _feat_init_new = torch.zeros(batch_size, p_idx_end - p_idx_start, self.latent_dim,
-                                             device=_fmaps_seq_new.device, dtype=_fmaps_seq_new.dtype)
-                assert batch_size == 1
-                assert ((query_points_t_[p_idx_start:p_idx_end] > new_seq_t0)
-                        | (query_points_t_[p_idx_start:p_idx_end] < new_seq_t1)).all()
-                batch_idx = 0
-                for t in range(new_seq_t0, new_seq_t1):
-                    query_mask = query_points_t_[p_idx_start:p_idx_end] == t
-                    if query_mask.sum() == 0:
-                        continue
-                    query_points_world = query_points_xyz_worldspace_[batch_idx, p_idx_start:p_idx_end][query_mask]
-
-                    rgbd_xyz_current = rgbd_xyz[batch_idx, t - new_seq_t0].reshape(-1, 3)  # Combine views for frame
-                    rgbd_fvec_current = rgbd_fvec[batch_idx, t - new_seq_t0].reshape(-1, self.latent_dim)
-
-                    k = 1
-                    neighbor_dists, neighbor_indices = knn(k, rgbd_xyz_current[None],
-                                                           query_points_world[None])
-                    assert k == 1, "If k > 1, the code below should be modified to handle multiple neighbors -- how to combine the features of multiple neighbors?"
-                    neighbor_xyz = rgbd_xyz_current[neighbor_indices[0, :, 0]]
-                    neighbor_fvec = rgbd_fvec_current[neighbor_indices[0, :, 0]]
-
-                    _feat_init_new[batch_idx, query_mask] = neighbor_fvec
-
-                feat_init = smart_cat(feat_init, _feat_init_new.repeat(1, self.S, 1, 1), dim=2)
-
-            # Update the initial coordinates and visibility for non-first windows
-            if p_idx_start > 0:
-                last_coords = coords[-1][:, self.S // 2:].clone()  # Take the predicted coords from the last window
-                coords_init_[:, : self.S // 2, :p_idx_start] = last_coords
-                coords_init_[:, self.S // 2:, :p_idx_start] = last_coords[:, -1].repeat(1, self.S // 2, 1, 1)
-
-                last_vis = vis[:, self.S // 2:][..., None]
-                vis_init_[:, : self.S // 2, :p_idx_start] = last_vis
-                vis_init_[:, self.S // 2:, :p_idx_start] = last_vis[:, -1].repeat(1, self.S // 2, 1, 1)
-
-            track_mask_current = track_mask_[:, w_idx_start: w_idx_start + self.S, :p_idx_end]
-            if S_local < self.S:
-                track_mask_current = torch.cat([
-                    track_mask_current,
-                    track_mask_current[:, -1:].repeat(1, self.S - S_local, 1, 1),
-                ], 1)
-
-            coords, vis, _ = self.forward_iteration(
-                fmaps=fmaps_seq,
-                depths=depths_seq,
-                intrs=intrs_seq,
-                extrs=extrs_seq,
-                coords_init=coords_init_[:, :, :p_idx_end],
-                feat_init=feat_init[:, :, :p_idx_end],
-                vis_init=vis_init_[:, :, :p_idx_end],
-                track_mask=track_mask_current,
-                iters=iters,
-                save_debug_logs=save_debug_logs,
-                debug_logs_path=debug_logs_path,
-                debug_logs_prefix=f"__widx-{w_idx_start}_pidx-{p_idx_start}-{p_idx_end}",
-                debug_logs_window_idx=w_idx_start,
-                save_rerun_logs=save_rerun_logs,
-                rerun_fmap_coloring_fn=rerun_fmap_coloring_fn,
+        if self.p_idx_end - self.p_idx_start > 0: # if there are new query points in this winodw
+            rgbd_xyz, rgbd_fvec = init_pointcloud_from_rgbd(
+                fmaps=fmaps_interp,
+                depths=depths_interp,
+                intrs=intrs,
+                extrs=extrs,
+                stride=self.stride,
             )
 
-            if is_train:
-                coord_predictions.append([
-                    coord[:, :S_local]
-                    if not self.normalize_scene_in_fwd_pass
-                    else transform_scene(T_scale_inv, T_rot_inv, T_translation_inv,
-                                         None, None, None, coord[:, :S_local][0], None)[2][None]
-                    for coord in coords
-                ])
-                vis_predictions.append(vis[:, :S_local])
+            rgbd_xyz = rgbd_xyz.reshape(batch_size, self.S, num_views, strided_height * strided_width, 3)
+            rgbd_fvec = rgbd_fvec.reshape(batch_size, self.S, num_views, strided_height * strided_width, self.latent_dim)
+            _feat_init_new = torch.zeros(batch_size, self.p_idx_end - self.p_idx_start, self.latent_dim, device=_fmaps_interp.device, dtype=_fmaps_interp.dtype)
 
-            traj_e_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = coords[-1][:, :S_local]
-            vis_e_[:, w_idx_start:w_idx_start + self.S, :p_idx_end] = torch.sigmoid(vis[:, :S_local])
+            batch_idx = 0
+            for t in range(self.S):
+                query_mask = query_points_t_[self.p_idx_start:self.p_idx_end] == self.online_ind +t
+                if query_mask.sum() == 0:
+                    continue
+                query_points_world = query_points_xyz_worldspace_[batch_idx, self.p_idx_start:self.p_idx_end][query_mask]
+                rgbd_xyz_current = rgbd_xyz[batch_idx, t].reshape(-1, 3) # Combine views for frame
+                rgbd_fvec_current = rgbd_fvec[batch_idx, t].reshape(-1, self.latent_dim) # Combine views for frame
 
-            track_mask_[:, : w_idx_start + self.S, :p_idx_end] = 0.0
-            w_idx_start = w_idx_start + self.S // 2
+                k = 1
+                _, neighbor_indices = knn(k, rgbd_xyz_current[None], query_points_world[None])
+                assert k == 1, "If k > 1, the code below should be modified to handle multiple neighbors -- how to combine the features of multiple neighbors?"
+                neighbor_fvec = rgbd_fvec_current[neighbor_indices[0, :, 0]]
 
-            p_idx_start = p_idx_end
+                _feat_init_new[batch_idx, query_mask] = neighbor_fvec
+            self.online_feat_init = smart_cat(self.online_feat_init, _feat_init_new.repeat(1, self.S, 1, 1), dim=2)
+        
+        # Update the initial coordinates and visibility for non-first inputs
+        if self.p_idx_start > 0 and self.online_coords_predicted is not None:
+            last_coords = self.online_coords_predicted[:, self.S//2:].clone()
+            coords_init_[:, : self.S // 2, :self.p_idx_start] = last_coords
+            coords_init_[:, self.S // 2:, :self.p_idx_start] = last_coords[:, -1].repeat(1, self.S // 2, 1, 1)
 
+            last_vis = self.online_vis_predicted[:, self.S // 2:][..., None]
+            vis_init_[:, : self.S // 2, :self.p_idx_start] = last_vis
+            vis_init_[:, self.S // 2:, :self.p_idx_start] = last_vis[:, -1].repeat(1, self.S // 2, 1, 1)
+
+        track_mask_current = track_mask_[:, :num_frames, :self.p_idx_end]
+        if num_frames < self.S:
+            track_mask_current = torch.cat([
+                track_mask_current,
+                track_mask_current[:, -1:].repeat(1, self.S - num_frames, 1, 1),
+            ], 1)
+        
+        coords, vis, feat_init = self.forward_iteration(
+            fmaps=fmaps_interp,
+            depths=depths_interp,
+            intrs=intrs,
+            extrs=extrs,
+            coords_init=coords_init_[:, :, :self.p_idx_end],
+            feat_init=self.online_feat_init[:, :, :self.p_idx_end],
+            vis_init=vis_init_[:, :, :self.p_idx_end],
+            track_mask=track_mask_current,
+            iters=iters,
+            save_debug_logs=save_debug_logs,
+            debug_logs_path=debug_logs_path,
+            debug_logs_prefix=f"__widx-{self.online_ind}_pidx-{self.p_idx_start}-{self.p_idx_end}",
+            debug_logs_window_idx=self.online_ind,
+            save_rerun_logs=save_rerun_logs,
+            rerun_fmap_coloring_fn=rerun_fmap_coloring_fn,
+        )
+        # if is_train:
+
+        self.online_coords_predicted = coords[-1]
+        self.online_vis_predicted = vis
+
+        traj_e_[:, :, :self.p_idx_end] = self.online_coords_predicted[:, :num_frames]
+        vis_e_[:, :, :self.p_idx_end] = torch.sigmoid(self.online_vis_predicted[:, :num_frames])
+
+        self.online_ind = self.online_ind + self.S // 2
+        self.p_idx_start = self.p_idx_end
+
+        ###################################Modified region end##################################################
         if save_debug_logs:
             import gpustat
             torch.cuda.empty_cache()
@@ -725,7 +681,7 @@ class MVTracker(nn.Module):
                 "vis_predictions": vis_predictions,
                 "coord_predictions": coord_predictions,
                 "attn_predictions": None,
-                "p_idx_end_list": p_idx_end_list,
+                # "p_idx_end_list": p_idx_end_list,
                 "sort_inds": sort_inds,
                 "Rigid_ln_total": None,
             }
@@ -1031,3 +987,4 @@ class PointcloudCorrBlock:
                         ))
             logging.info(f"rerun for {debug_logs_prefix} done")
         return output
+

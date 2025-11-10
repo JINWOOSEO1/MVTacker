@@ -16,7 +16,7 @@ def lift_pixels_to_world(depths, intrs, extrs):
     u, v = torch.meshgrid(
         torch.arange(W, device=device),
         torch.arange(H, device=device),
-        indexing="xy"
+        indexing="xy"   
     )
     ones = torch.ones_like(u)
 
