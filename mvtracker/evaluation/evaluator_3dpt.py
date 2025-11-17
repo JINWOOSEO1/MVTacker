@@ -11,7 +11,7 @@ from typing import Optional
 import imageio
 import matplotlib.cm as cm
 import numpy as np
-import rerun as rr
+# import rerun as rr
 import torch
 from sklearn.cluster import KMeans
 from threadpoolctl import threadpool_limits
@@ -23,7 +23,7 @@ from mvtracker.evaluation.metrics import compute_tapvid_metrics_original, evalua
 from mvtracker.models.core.model_utils import world_space_to_pixel_xy_and_camera_z, \
     pixel_xy_and_camera_z_to_world_space, init_pointcloud_from_rgbd
 from mvtracker.utils.visualizer_mp4 import log_mp4_track_viz
-from mvtracker.utils.visualizer_rerun import log_pointclouds_to_rerun, log_tracks_to_rerun
+# from mvtracker.utils.visualizer_rerun import log_pointclouds_to_rerun, log_tracks_to_rerun
 
 
 class NumpyEncoder(json.JSONEncoder):

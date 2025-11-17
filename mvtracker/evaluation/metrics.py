@@ -23,6 +23,7 @@ def compute_metrics(
     tapvid_metrics = compute_tapvid_metrics(query_points, gt_occluded, gt_tracks, pred_occluded,
                                             pred_tracks, distance_thresholds, query_mode)
 
+
     # Compute distances only for visible points
     visible_mask = ~gt_occluded
     distances = torch.norm(pred_tracks - gt_tracks, dim=-1)
@@ -402,5 +403,6 @@ def evaluate_predictions(
 
     df_per_track = pd.DataFrame(results_per_track)
     df_per_track = df_per_track.round(2)
+
 
     return df, df_per_track

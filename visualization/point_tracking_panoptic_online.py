@@ -61,6 +61,8 @@ def main():
     ####################################################
 
     K = 12 # the number of frames that needs to operate mvtracker
+    step = 3
+    mvtracker.step = step
 
     def render_image(rgb, depth, intr, extr):
         
@@ -114,12 +116,12 @@ def main():
         pred_tracks = results["traj_e"].to(device)  # [1,K,N,3] tensor
         pred_vis = results["vis_e"].to(device)      # [1,K,N]
 
-        for t in range(K//2):
+        for t in range(step):
             add_point_cloud(t)
+
     window_num = 0
-    
     mvtracker.init_video_online_processing()
-    for t in range(0,T,K//2):
+    for t in range(0,T-K+1,step):
         render_image(rgbs[:,t:t+K,:,:,:], depths[:,t:t+K,:,:,:], intrs[:,t:t+K,:,:], extrs[:,t:t+K,:,:])
         print("window_num" , window_num)
         window_num = window_num + 1

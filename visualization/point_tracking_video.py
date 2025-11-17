@@ -1,4 +1,5 @@
 import torch
+from torch import nn
 import numpy as np
 from huggingface_hub import hf_hub_download
 import viser
@@ -19,7 +20,7 @@ def main():
 
     # Make New samples
     base_dir = "../../datasets/0926"
-    B, T , W, H= 3, 132, 1020, 1020 # Isn't H = 720?? Why the height of second view image is 1006? 
+    B, T , W, H= 3, 132, 1020, 1020 
 
     rgbs = np.zeros((B, T, 3, H, W), dtype=np.float32)
     depths = np.zeros((B, T, 1, H, W), dtype=np.float32)
@@ -53,105 +54,87 @@ def main():
         print(f"{b+1} view is finished")
 
     query_points = np.load("../../datasets/0926/video_input_query_point.npy").astype(np.float32)
-    zeros = np.zeros((query_points.shape[0],1))
+    zeros = np.zeros((query_points.shape[0],1), dtype=np.float32)
     query_points = np.hstack((zeros, query_points)) # (20,4)
 
     N = query_points.shape[0]
-    K = 12 # the number of frames that needs to operate mvtracker
-    current_frame_idx = -1
 
-    # set queue
-    rgb_window = torch.zeros((B, K, 3, H, W)).to(device)
-    depth_window = torch.zeros((B, K, 1, H, W)).to(device)
-    intr_window = torch.zeros((B, K, 3, 3)).to(device)
-    extr_window = torch.zeros((B, K, 4, 4)).to(device)
-    query_points_window = torch.zeros((K, N, 4)).to(device)
+    # set tensor
+    rgb_tensor = torch.from_numpy(rgbs).to(device)
+    depth_tensor = torch.from_numpy(depths).to(device)
+    intr_tensor = torch.from_numpy(intrs).to(device)
+    extr_tensor = torch.from_numpy(extrs).to(device)
+    query_points_tensor = torch.from_numpy(query_points).to(device)
+    
+    rgb_tensor_interp = nn.functional.interpolate(
+        input=rgb_tensor.reshape(B*T, 3, H, W),
+        scale_factor=0.5,
+        mode='bilinear',
+    ).reshape(B, T, 3, H//2, W//2)
 
-    def render_image(rgb, depth, intr, extr):
-        nonlocal current_frame_idx
-        nonlocal query_points_window
+    depth_tensor_interp = nn.functional.interpolate(
+        input=depth_tensor.reshape(B*T, 1, H, W),
+        scale_factor=0.5,
+        mode='nearest',
+    ).reshape(B, T, 1, H//2, W//2)
 
-        current_frame_idx = current_frame_idx + 1
-        current_insert_location = current_frame_idx % K
+    intr_tensor_interp = intr_tensor // 2.0
+    intr_tensor_interp[:, :, 2, 2] = 1.00
 
-        rgb_window[:,current_insert_location] = torch.from_numpy(rgb).to(device)
-        depth_window[:, current_insert_location] = torch.from_numpy(depth).to(device)
-        intr_window[:, current_insert_location] = torch.from_numpy(intr).to(device)
-        extr_window[:, current_insert_location] = torch.from_numpy(extr).to(device)
+    with torch.no_grad():
+        start_time = time.time()        
+        results = mvtracker(
+            rgbs=rgb_tensor_interp[None] / 255.0,   
+            depths=depth_tensor_interp[None],       
+            intrs=intr_tensor_interp[None],         
+            extrs=extr_tensor[None,:,:,0:3,:],        
+            query_points=query_points_tensor[None],
+        )    
+        print("Iteration takes: ", time.time()-start_time)
 
-        if(current_frame_idx < (K-1)): # if current_frame_idx is 0~(K-2), there are lack of infromation to apply mvtracker
-            return
+    pred_tracks = results["traj_e"].to(device)  # [1,K,N,3] tensor
+    pred_vis = results["vis_e"].to(device)      # [1,K,N]
 
-        rgb_input_tensor = torch.cat((rgb_window[:, current_insert_location+1:], rgb_window[:, :current_insert_location+1]), dim=1)
-        depth_input_tensor = torch.cat((depth_window[:, current_insert_location+1:], depth_window[:, :current_insert_location+1]), dim=1)
-        intr_input_tensor = torch.cat((intr_window[:, current_insert_location+1:], intr_window[:, :current_insert_location+1]), dim=1)
-        extr_input_tensor = torch.cat((extr_window[:, current_insert_location+1:], extr_window[:, :current_insert_location+1]), dim=1)
+    def add_point_cloud(t):
+        pcd_world = []
+        colors = []
+        for cam_idx in range(B):
+            pcd = lift_pixels_to_world(depth_tensor_interp[cam_idx, t, 0], intr_tensor_interp[cam_idx, t], extr_tensor[cam_idx, t])
+            pcd_world.append(pcd.detach().cpu().numpy())
+            color = rgb_tensor_interp[cam_idx, t] # (3, H, W)
+            colors.append(color.permute(1,2,0).detach().cpu().numpy() / 255.0)
 
-        if current_frame_idx == K-1:
-            query_points_window[1] = torch.from_numpy(query_points).to(device)
+        pcd_world = np.concatenate(pcd_world) # (H*B, W, 3)
+        colors = np.concatenate(colors) # (H*B, W, 3)    
 
-        with torch.no_grad():
-            start_time = time.time()        
+        # crop workspace
+        workspace_bounds = np.array([[0, 1.0], [-0.5, 0.5], [-0.5, 0.5]])
+        workspace_mask = (pcd_world[..., 0] > workspace_bounds[0, 0]) & (pcd_world[..., 0] < workspace_bounds[0, 1]) &\
+            (pcd_world[..., 1] > workspace_bounds[1, 0]) & (pcd_world[..., 1] < workspace_bounds[1, 1]) &\
+            (pcd_world[..., 2] > workspace_bounds[2, 0]) & (pcd_world[..., 2] < workspace_bounds[2, 1])
+        pcd_world = pcd_world[workspace_mask]
+        colors = colors[workspace_mask]
 
-            results = mvtracker(
-                rgbs=rgb_input_tensor[None] / 255.0,   
-                depths=depth_input_tensor[None],       
-                intrs=intr_input_tensor[None],         
-                extrs=extr_input_tensor[None,:,:,0:3,:],        
-                query_points=query_points_window[1:2],
-            )    
-            print("Iteration takes: ", time.time()-start_time)
+        server.scene.add_point_cloud(
+            name="/point_cloud",
+            points=pcd_world.reshape(-1,3),
+            colors=colors.reshape(-1, 3),
+            point_size=0.005,
+        )
 
-
-        pred_tracks = results["traj_e"].to(device)  # [1,K,N,3] tensor
-        pred_vis = results["vis_e"].to(device)      # [1,K,N]
-
-        def add_point_cloud(t):
-            pcd_world = []
-            colors = []
-            for cam_idx in range(B):
-                pcd = lift_pixels_to_world(depth_window[cam_idx, t, 0], intr_window[cam_idx, t], extr_window[cam_idx, t])
-                pcd_world.append(pcd.detach().cpu().numpy())
-                color = rgb_window[cam_idx, t] # (3, H, W)
-                colors.append(color.permute(1,2,0).detach().cpu().numpy() / 255.0)
-
-
-            pcd_world = np.concatenate(pcd_world) # (H*B, W, 3)
-            colors = np.concatenate(colors) # (H*B, W, 3)    
-
-            # crop workspace
-            workspace_bounds = np.array([[0, 1.0], [-0.5, 0.5], [-0.5, 0.5]])
-            workspace_mask = (pcd_world[..., 0] > workspace_bounds[0, 0]) & (pcd_world[..., 0] < workspace_bounds[0, 1]) &\
-                (pcd_world[..., 1] > workspace_bounds[1, 0]) & (pcd_world[..., 1] < workspace_bounds[1, 1]) &\
-                (pcd_world[..., 2] > workspace_bounds[2, 0]) & (pcd_world[..., 2] < workspace_bounds[2, 1])
-            pcd_world = pcd_world[workspace_mask]
-            colors = colors[workspace_mask]
-
-            server.scene.add_point_cloud(
-                name="/point_cloud",
-                points=pcd_world.reshape(-1,3),
-                colors=colors.reshape(-1, 3),
-                point_size=0.005,
-            )
-
-            track_data = pred_tracks[0,-1].detach().cpu().numpy()
-            color = np.array([0.76, 0.96, 0.15], dtype=np.float32)
-            server.scene.add_point_cloud(
-                    name="/query_point_cloud",
-                    points=track_data,
-                    colors=np.tile(color, (track_data.shape[0], 1)),
-                    point_size=0.01,
-            )
-          
-        new_column = torch.zeros((K, N, 1), device=device, dtype = torch.float32)   
-
-        # Neglect rendering 0~K-2 images
-        query_points_window = torch.concatenate((new_column, pred_tracks[0]), dim=2)
-        add_point_cloud(current_insert_location)
-        print(f"Finish rendering {current_frame_idx+1}th image")
-        
-    for t in range(0,T):
-        render_image(rgbs[:,t,:,:,:], depths[:,t,:,:,:], intrs[:,t,:,:], extrs[:,t,:,:])
+        track_data = pred_tracks[0,t].detach().cpu().numpy()
+        color = np.array([0.76, 0.96, 0.15], dtype=np.float32)
+        server.scene.add_point_cloud(
+                name="/query_point_cloud",
+                points=track_data,
+                colors=np.tile(color, (track_data.shape[0], 1)),
+                point_size=0.01,
+        )
+    for t in range(T):
+        add_point_cloud(t)
+        time.sleep(0.5)
+        print(f"Finish rendering {t}th image")
+    
     
 
 if __name__ == "__main__":

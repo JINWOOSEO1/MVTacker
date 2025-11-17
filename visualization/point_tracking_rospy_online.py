@@ -15,6 +15,8 @@ import cv2
 from sensor_msgs.msg import CompressedImage, CameraInfo
 import pdb
 
+main_camera_index = 2
+
 def ros_compressed_image_to_cv_image(
     msg: CompressedImage, encoding=cv2.IMREAD_UNCHANGED
 ):
@@ -32,7 +34,6 @@ class DataCaptureNode:
         self.num_new_img = 0
 
         self.num_cameras = num_cameras
-
 
         self.rgb_subscribers = []
         self.depth_subscribers = []
@@ -85,7 +86,7 @@ class DataCaptureNode:
         self.rgb_images[camera_index].append(cv_image.astype(np.uint8))
         if(len(self.rgb_images[camera_index]) > self.window_len):
             self.rgb_images[camera_index].pop(0)
-        if camera_index == 1:
+        if camera_index == main_camera_index:
             self.num_new_img = self.num_new_img + 1
 
     def depth_callback(self, msg, camera_index):
@@ -123,24 +124,25 @@ class DataCaptureNode:
             
             self.camera_infos[camera_index].append(np.array(K).reshape(3,3))
 
-
     def get_camera_intrinsic(self, index):
         if self.camera_infos[index] is None:
             return None
         return np.array(self.camera_infos[index].K).reshape(3, 3)
 
-
 def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mvtracker = MVTrackerOnline(hidden_size=256, fmaps_dim=128) 
+    capture_node = DataCaptureNode(num_cameras=args.num_cameras, crop_regions_path=args.crop_regions_path)
+    
+    mvtracker = MVTrackerOnline(hidden_size=256, fmaps_dim=128, capture_node=capture_node) 
     mvtracker.load_state_dict(torch.load("checkpoints/mvtracker_200000_june2025.pth"))
     mvtracker.to(device).eval()
+    mvtracker.init_video_online_processing()
+
     server = viser.ViserServer(host="0.0.0.0")
-    capture_node = DataCaptureNode(num_cameras=args.num_cameras, crop_regions_path=args.crop_regions_path)
     rospy.init_node("data_capture_node", anonymous=True)
 
     # Extrinsic matrix & Query points
-    base_dir = "../../datasets/extrinsics"
+    base_dir = "../../datasets/rospy_input_1021"
     extrs = np.zeros((args.num_cameras, 4, 4), dtype = np.float32)
     for b in range(args.num_cameras):
         extr_file_path = os.path.join(base_dir, f"cam_{b+1}_extrinsics.npy")
@@ -150,9 +152,9 @@ def main(args):
 
     query_points_path = os.path.join(base_dir,"query_point.npy")
     query_points = np.load(query_points_path).astype(np.float32)
-    zeros = np.zeros((query_points.shape[0],1))
+    zeros = np.zeros((query_points.shape[0],1), dtype = np.float32)
     query_points = np.hstack((zeros, query_points)) # (20,4)
-    query_points = torch.from_numpy(query_points).float().to(device)
+    query_points = torch.from_numpy(query_points).to(device)
 
     B = args.num_cameras
     N = query_points.shape[0]
@@ -164,14 +166,13 @@ def main(args):
             rgb = rgb.transpose(0, 1, 4, 2, 3)   # (B, K, 3, H, W)
             depth = depth.transpose(0, 1, 4, 2, 3) # (B, K, 1, H, W)
 
-        rgb_window = torch.from_numpy(rgb).to(device).float()
-        depth_window = torch.from_numpy(depth).to(device).float()
-        intr_window = torch.from_numpy(intr).to(device).float()
+        rgb_window = torch.from_numpy(rgb).to(device)
+        depth_window = torch.from_numpy(depth).to(device)
+        intr_window = torch.from_numpy(intr).to(device)
         extr_window = torch.from_numpy(extr).to(device)
 
         with torch.no_grad():
             start_time = time.time()        
-
             results = mvtracker(
                 rgbs=rgb_window[None] / 255.0,   
                 depths=depth_window[None],       
@@ -212,7 +213,7 @@ def main(args):
                 point_size=0.005,
             )
 
-            track_data = pred_tracks[0,-1].detach().cpu().numpy()
+            track_data = pred_tracks[0,t].detach().cpu().numpy()
             color = np.array([0.76, 0.96, 0.15], dtype=np.float32)
             server.scene.add_point_cloud(
                     name="/query_point_cloud",
@@ -222,30 +223,30 @@ def main(args):
             )
 
         start_time = time.time()
-        for t in range(capture_node.window_len//2):
+        for t in range(mvtracker.step):
             add_point_cloud(t)
         print("Rendering time takes: ", time.time()-start_time)
         
-    mvtracker.init_video_online_processing()
     while not rospy.is_shutdown():
-        if  len(capture_node.rgb_images[2]) < capture_node.window_len or \
-            len(capture_node.depth_images[2]) < capture_node.window_len or \
-            len(capture_node.camera_infos[2]) < capture_node.window_len:
+        if  len(capture_node.rgb_images[main_camera_index]) < capture_node.window_len or \
+            len(capture_node.depth_images[main_camera_index]) < capture_node.window_len or \
+            len(capture_node.camera_infos[main_camera_index]) < capture_node.window_len:
             
             rospy.loginfo_throttle(1.0, "Waiting for data from all cameras...")
             rospy.sleep(0.1) 
             continue
-        if capture_node.num_new_img >= capture_node.window_len//2:
-            capture_node.num_new_img = 0
+    
+        print(capture_node.num_new_img, " new images received.")
+        capture_node.num_new_img = 0
 
-            rgbs = np.array(capture_node.rgb_images).copy() #(B, K, H, W, 3)
-            depths = np.array(capture_node.depth_images).copy()[:,:,:,:,None] / 1000.0 #(B, K, H, W, 1)
-            intrs = np.array(capture_node.camera_infos) #(B, K, 3, 3)
-            _extrs = np.tile(extrs[:, None, : ,:], (1, capture_node.window_len, 1, 1)) #(B, K, 4, 4)
+        rgbs = np.array(capture_node.rgb_images, dtype=np.float32).copy() # (B, K, H, W, 3)
+        depths = np.array(capture_node.depth_images, dtype=np.float32).copy()[:,:,:,:,None] / 1000.0 # (B, K, H, W, 1)
+        intrs = np.array(capture_node.camera_infos, dtype=np.float32) # (B, K, 3, 3)
+        _extrs = np.tile(extrs[:, None, : ,:], (1, capture_node.window_len, 1, 1)) # (B, K, 4, 4)
 
-            s_time = time.time()
-            render_image(rgbs, depths, intrs, _extrs, channel_last=True) # Have to check if the new input length is almost 6 while executing render_image()
-            print("Total time takes: ", time.time()-s_time, "\n")
+        s_time = time.time()
+        render_image(rgbs, depths, intrs, _extrs, channel_last=True) 
+        print("Total time takes: ", time.time()-s_time, "\n")
 
 if __name__ == "__main__":
     parser = ArgumentParser()

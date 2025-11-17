@@ -1,5 +1,4 @@
 import torch
-from torch import nn as nn
 import numpy as np
 from huggingface_hub import hf_hub_download
 import viser
@@ -7,21 +6,20 @@ import time
 import os
 from PIL import Image
 import random
-from mvtracker.models.core.mvtracker.mvtracker_online import MVTrackerOnline
+from mvtracker.models.core.mvtracker.mvtracker import MVTracker
 from visualization.utils import lift_pixels_to_world
 import rospy
 
 def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mvtracker = MVTrackerOnline(hidden_size=256, fmaps_dim=128) 
+    mvtracker = MVTracker(hidden_size=256, fmaps_dim=128) 
     mvtracker.load_state_dict(torch.load("checkpoints/mvtracker_200000_june2025.pth"))
     mvtracker.to(device).eval()
-    mvtracker.init_video_online_processing()
     server = viser.ViserServer(host="0.0.0.0")
 
     # Make New samples
     base_dir = "../../datasets/0926"
-    B, T , W, H= 3, 132, 1020, 1020
+    B, T , W, H= 3, 132, 1020, 1020 
 
     rgbs = np.zeros((B, T, 3, H, W), dtype=np.float32)
     depths = np.zeros((B, T, 1, H, W), dtype=np.float32)
@@ -55,25 +53,55 @@ def main():
         print(f"{b+1} view is finished")
 
     query_points = np.load("../../datasets/0926/video_input_query_point.npy").astype(np.float32)
-    zeros = np.zeros((query_points.shape[0],1), dtype=np.float32)
+    zeros = np.zeros((query_points.shape[0],1))
     query_points = np.hstack((zeros, query_points)) # (20,4)
 
     N = query_points.shape[0]
     K = 12 # the number of frames that needs to operate mvtracker
-    step = 6
-    mvtracker.step = step
+    current_frame_idx = -1
+
+    # set queue
+    rgb_window = torch.zeros((B, K, 3, H, W)).to(device)
+    depth_window = torch.zeros((B, K, 1, H, W)).to(device)
+    intr_window = torch.zeros((B, K, 3, 3)).to(device)
+    extr_window = torch.zeros((B, K, 4, 4)).to(device)
+    query_points_window = torch.zeros((K, N, 4)).to(device)
 
     def render_image(rgb, depth, intr, extr):
+        nonlocal current_frame_idx
+        nonlocal query_points_window
+
+        current_frame_idx = current_frame_idx + 1
+        current_insert_location = current_frame_idx % K
+
+        rgb_window[:,current_insert_location] = torch.from_numpy(rgb).to(device)
+        depth_window[:, current_insert_location] = torch.from_numpy(depth).to(device)
+        intr_window[:, current_insert_location] = torch.from_numpy(intr).to(device)
+        extr_window[:, current_insert_location] = torch.from_numpy(extr).to(device)
+
+        if(current_frame_idx < (K-1)): # if current_frame_idx is 0~(K-2), there are lack of infromation to apply mvtracker
+            return
+
+        rgb_input_tensor = torch.cat((rgb_window[:, current_insert_location+1:], rgb_window[:, :current_insert_location+1]), dim=1)
+        depth_input_tensor = torch.cat((depth_window[:, current_insert_location+1:], depth_window[:, :current_insert_location+1]), dim=1)
+        intr_input_tensor = torch.cat((intr_window[:, current_insert_location+1:], intr_window[:, :current_insert_location+1]), dim=1)
+        extr_input_tensor = torch.cat((extr_window[:, current_insert_location+1:], extr_window[:, :current_insert_location+1]), dim=1)
+
+        if current_frame_idx == K-1:
+            query_points_window[1] = torch.from_numpy(query_points).to(device)
+
         with torch.no_grad():
             start_time = time.time()        
+
             results = mvtracker(
-                rgbs=rgb[None] / 255.0,   
-                depths=depth[None],       
-                intrs=intr[None],         
-                extrs=extr[None,:,:,0:3,:],        
-                query_points=query_points_tensor[None].to(device),
+                rgbs=rgb_input_tensor[None] / 255.0,   
+                depths=depth_input_tensor[None],       
+                intrs=intr_input_tensor[None],         
+                extrs=extr_input_tensor[None,:,:,0:3,:],        
+                query_points=query_points_window[1:2],
             )    
             print("Iteration takes: ", time.time()-start_time)
+
 
         pred_tracks = results["traj_e"].to(device)  # [1,K,N,3] tensor
         pred_vis = results["vis_e"].to(device)      # [1,K,N]
@@ -82,10 +110,11 @@ def main():
             pcd_world = []
             colors = []
             for cam_idx in range(B):
-                pcd = lift_pixels_to_world(depth[cam_idx, t, 0], intr[cam_idx, t], extr[cam_idx, t])
+                pcd = lift_pixels_to_world(depth_window[cam_idx, t, 0], intr_window[cam_idx, t], extr_window[cam_idx, t])
                 pcd_world.append(pcd.detach().cpu().numpy())
-                color = rgb[cam_idx, t] # (3, H, W)
+                color = rgb_window[cam_idx, t] # (3, H, W)
                 colors.append(color.permute(1,2,0).detach().cpu().numpy() / 255.0)
+
 
             pcd_world = np.concatenate(pcd_world) # (H*B, W, 3)
             colors = np.concatenate(colors) # (H*B, W, 3)    
@@ -105,7 +134,7 @@ def main():
                 point_size=0.005,
             )
 
-            track_data = pred_tracks[0,t].detach().cpu().numpy()
+            track_data = pred_tracks[0,-1].detach().cpu().numpy()
             color = np.array([0.76, 0.96, 0.15], dtype=np.float32)
             server.scene.add_point_cloud(
                     name="/query_point_cloud",
@@ -113,38 +142,17 @@ def main():
                     colors=np.tile(color, (track_data.shape[0], 1)),
                     point_size=0.01,
             )
+          
+        new_column = torch.zeros((K, N, 1), device=device, dtype = torch.float32)   
 
-        for i in range(step):  
-            add_point_cloud(i)
+        # Neglect rendering 0~K-2 images
+        query_points_window = torch.concatenate((new_column, pred_tracks[0]), dim=2)
+        add_point_cloud(current_insert_location)
+        print(f"Finish rendering {current_frame_idx+1}th image")
+        
+    for t in range(0,T):
+        render_image(rgbs[:,t,:,:,:], depths[:,t,:,:,:], intrs[:,t,:,:], extrs[:,t,:,:])
     
-    rgb_tensor = torch.from_numpy(rgbs).to(device)
-    depth_tensor = torch.from_numpy(depths).to(device)
-    intr_tensor = torch.from_numpy(intrs).to(device)
-    extr_tensor = torch.from_numpy(extrs).to(device)
-    query_points_tensor = torch.from_numpy(query_points).to(device)
 
-    # Interpolation
-    rgb_interp = nn.functional.interpolate(
-        input=rgb_tensor.reshape(B*T, 3, H, W),
-        scale_factor=0.5,
-        mode='bilinear',
-        align_corners=False,
-    ).reshape(B, T, 3, H//2, W//2)
-
-    depth_interp= nn.functional.interpolate(
-        input=depth_tensor.reshape(B*T, 1, H, W),
-        scale_factor=0.5,
-        mode='nearest',
-    ).reshape(B, T, 1, H//2, W//2)
-
-    intr_interp = intr_tensor // 2.0
-    intr_interp[:, :, 2, 2] = 1.00
-    # intr_interp = intr_tensor
-    # rgb_interp = rgb_tensor
-    # depth_interp = depth_tensor
-
-    for t in range(0, T-K+1, step):
-        render_image(rgb_interp[:,t:t+K,:,:,:], depth_interp[:,t:t+K,:,:,:], intr_interp[:,t:t+K,:,:], extr_tensor[:,t:t+K,:,:])
-    
 if __name__ == "__main__":
     main()

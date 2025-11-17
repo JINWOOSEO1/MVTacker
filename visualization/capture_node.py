@@ -5,7 +5,7 @@ import numpy as np
 import rospy
 from sensor_msgs.msg import CompressedImage, CameraInfo
 
-
+main_camera_index = 0
 def ros_compressed_image_to_cv_image(
     msg: CompressedImage, encoding=cv2.IMREAD_UNCHANGED
 ):
@@ -17,18 +17,20 @@ def ros_compressed_image_to_cv_image(
     cv_image = cv2.imdecode(np_arr, encoding)
     return cv_image
 
-
 class DataCaptureNode:
     def __init__(self, num_cameras=1, crop_regions_path=None):
+        self.window_len = 12
+        self.num_new_img = 0
+
         self.num_cameras = num_cameras
 
         self.rgb_subscribers = []
         self.depth_subscribers = []
         self.camera_info_subscribers = []
 
-        self.rgb_images = [None] * num_cameras
-        self.depth_images = [None] * num_cameras
-        self.camera_infos = [None] * num_cameras
+        self.rgb_images = [[] for _ in range(num_cameras)]
+        self.depth_images = [[] for _ in range(num_cameras)]
+        self.camera_infos = [[] for _ in range(num_cameras)]
 
         self.crop_regions = None
         if crop_regions_path is not None:
@@ -65,7 +67,16 @@ class DataCaptureNode:
             x1, y1, x2, y2 = self.crop_regions[camera_index]
             cv_image = cv_image[y1:y2, x1:x2]
 
-        self.rgb_images[camera_index] = cv_image.astype(np.uint8)
+        TARGET_SIZE = (640, 360) 
+        if cv_image.shape[:2] != (TARGET_SIZE[1], TARGET_SIZE[0]):
+            cv_image = cv2.resize(cv_image, TARGET_SIZE, 
+                                interpolation=cv2.INTER_LINEAR)
+            
+        self.rgb_images[camera_index].append(cv_image.astype(np.uint8))
+        if(len(self.rgb_images[camera_index]) > self.window_len):
+            self.rgb_images[camera_index].pop(0)
+        if camera_index == main_camera_index:
+            self.num_new_img = self.num_new_img + 1
 
     def depth_callback(self, msg, camera_index):
         cv_image = ros_compressed_image_to_cv_image(msg, cv2.IMREAD_UNCHANGED)
@@ -74,10 +85,17 @@ class DataCaptureNode:
             x1, y1, x2, y2 = self.crop_regions[camera_index]
             cv_image = cv_image[y1:y2, x1:x2]
 
-        self.depth_images[camera_index] = cv_image
+        TARGET_SIZE = (640, 360) 
+        if cv_image.shape[:2] != (TARGET_SIZE[1], TARGET_SIZE[0]):
+            cv_image = cv2.resize(cv_image, TARGET_SIZE, 
+                                interpolation=cv2.INTER_NEAREST)
+
+        self.depth_images[camera_index].append(cv_image)
+        if(len(self.depth_images[camera_index]) > self.window_len):
+            self.depth_images[camera_index].pop(0)
 
     def camera_info_callback(self, msg: CameraInfo, camera_index):
-        if self.camera_infos[camera_index] is None:
+        if len(self.camera_infos[camera_index]) is not self.window_len:
             K = list(msg.K)
             cx = K[2]
             cy = K[5]
@@ -87,86 +105,15 @@ class DataCaptureNode:
                 cy -= y1
                 K[2] = cx
                 K[5] = cy
-                msg.K = K
-
-            self.camera_infos[camera_index] = msg
+            # Scaling for resizing to (640, 360 )
+            K[0] = K[0]/2
+            K[4] = K[4]/2
+            K[2] = K[2]/2
+            K[5] = K[5]/2
+            
+            self.camera_infos[camera_index].append(np.array(K).reshape(3,3))
 
     def get_camera_intrinsic(self, index):
         if self.camera_infos[index] is None:
             return None
         return np.array(self.camera_infos[index].K).reshape(3, 3)
-
-
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser.add_argument(
-        "--num_cameras", type=int, default=1, help="Number of cameras to subscribe to"
-    )
-    parser.add_argument(
-        "--crop_regions_path",
-        type=str,
-        default=None,
-        help="Path to load the cropping regions",
-    )
-    parser.add_argument(
-        "--save_dir", type=str, default=None, help="Path to save the rgbd stream"
-    )
-    args = parser.parse_args()
-
-    rospy.init_node("data_capture_node", anonymous=True)
-
-    capture_node = DataCaptureNode(
-        num_cameras=args.num_cameras, crop_regions_path=args.crop_regions_path
-    )
-
-    if args.save_dir is not None:
-        import os
-
-        os.makedirs(os.path.dirname(args.save_dir), exist_ok=True)
-
-        for i in range(args.num_cameras):
-            os.makedirs(os.path.join(args.save_dir, f"{i+1}"), exist_ok=True)
-
-    img_idx = 0
-    is_recording = False
-
-    while not rospy.is_shutdown():
-
-        for i in range(args.num_cameras):
-            if capture_node.rgb_images[i] is not None:
-                cv2.imshow(f"Camera {i} RGB", capture_node.rgb_images[i])
-            if capture_node.depth_images[i] is not None:
-                depth = capture_node.depth_images[i].copy()
-                depth = depth / 1000.0
-
-                depth_vis = cv2.convertScaleAbs(depth, alpha=255.0)
-
-                cv2.imshow(f"Camera {i} Depth", depth_vis)
-
-            if args.save_dir is not None and is_recording:
-                rgb_image = capture_node.rgb_images[i].copy()
-                depth = capture_node.depth_images[i].copy()
-                depth = depth / 1000.0
-
-                cv2.imwrite(
-                    os.path.join(args.save_dir, f"{i+1}", f"rgb_{img_idx:05d}.png"),
-                    rgb_image,
-                )
-                np.save(
-                    os.path.join(args.save_dir, f"{i+1}", f"depth_{img_idx:05d}.npy"),
-                    depth,
-                )
-                np.save(
-                    os.path.join(args.save_dir, f"{i+1}", f"intrinsic.npy"),
-                    capture_node.get_camera_intrinsic(i),
-                )
-
-                if i == args.num_cameras - 1:
-                    img_idx += 1
-
-        key = cv2.waitKey(100) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("r"):
-            is_recording = not is_recording
-            print(f"Recording: {is_recording}")
