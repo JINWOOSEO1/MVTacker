@@ -613,24 +613,24 @@ class MVTrackerOnline(nn.Module):
             self.online_feat_init = smart_cat(self.online_feat_init, _feat_init_new.repeat(1, self.S, 1, 1), dim=2)
         
         # Update the initial coordinates and visibility for non-first inputs
-        # if self.p_idx_start > 0 and self.online_coords_predicted is not None:
-        #     last_coords = self.online_coords_predicted[:, self.step:self.step + self.S //2].clone()
-        #     coords_init_[:, : self.S // 2, :self.p_idx_start] = last_coords
-        #     coords_init_[:, self.S // 2:, :self.p_idx_start] = last_coords[:, -1].repeat(1, self.S // 2, 1, 1)
-
-        #     last_vis = self.online_vis_predicted[:, self.step:self.step + self.S // 2][..., None]
-        #     vis_init_[:, : self.S // 2, :self.p_idx_start] = last_vis
-        #     vis_init_[:, self.S // 2:, :self.p_idx_start] = last_vis[:, -1].repeat(1, self.S // 2, 1, 1)
-
-
         if self.p_idx_start > 0 and self.online_coords_predicted is not None:
-            last_coords = self.online_coords_predicted[:, self.step:].clone()
-            coords_init_[:, : self.S - self.step, :self.p_idx_start] = last_coords
-            coords_init_[:, self.S - self.step:, :self.p_idx_start] = last_coords[:, -1].repeat(1, self.step, 1, 1)
+            last_coords = self.online_coords_predicted[:, self.step:self.step + self.S //2].clone()
+            coords_init_[:, : self.S // 2, :self.p_idx_start] = last_coords
+            coords_init_[:, self.S // 2:, :self.p_idx_start] = last_coords[:, -1].repeat(1, self.S // 2, 1, 1)
 
-            last_vis = self.online_vis_predicted[:, self.step:][..., None]
-            vis_init_[:, : self.S - self.step, :self.p_idx_start] = last_vis
-            vis_init_[:, self.S - self.step:, :self.p_idx_start] = last_vis[:, -1].repeat(1, self.step, 1, 1)
+            last_vis = self.online_vis_predicted[:, self.step:self.step + self.S // 2][..., None]
+            vis_init_[:, : self.S // 2, :self.p_idx_start] = last_vis
+            vis_init_[:, self.S // 2:, :self.p_idx_start] = last_vis[:, -1].repeat(1, self.S // 2, 1, 1)
+
+
+        # if self.p_idx_start > 0 and self.online_coords_predicted is not None:
+        #     last_coords = self.online_coords_predicted[:, self.step:].clone()
+        #     coords_init_[:, : self.S - self.step, :self.p_idx_start] = last_coords
+        #     coords_init_[:, self.S - self.step:, :self.p_idx_start] = last_coords[:, -1].repeat(1, self.step, 1, 1)
+
+        #     last_vis = self.online_vis_predicted[:, self.step:][..., None]
+        #     vis_init_[:, : self.S - self.step, :self.p_idx_start] = last_vis
+        #     vis_init_[:, self.S - self.step:, :self.p_idx_start] = last_vis[:, -1].repeat(1, self.step, 1, 1)
 
 
         track_mask_current = track_mask_[:, :num_frames, :self.p_idx_end]

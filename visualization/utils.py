@@ -30,3 +30,4 @@ def lift_pixels_to_world(depths, intrs, extrs):
     t = extrs[0:3, 3]   # (3,)
     world_coords = R.T @ (cam_coords - t.view(3,1))
     return world_coords.T.view(H, W, 3)  # (H, W, 3)
+
